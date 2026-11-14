@@ -2,11 +2,15 @@ const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const path = require('path');
+const { createSqlitePool } = require('./sqlite-pool');
+const { seedSqlite } = require('./seed-sqlite');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 
 const app = express();
 const port = process.env.PORT || 3000;
+let pool;
+let dbEngine = 'mysql';
 
 // Middleware
 app.use(cors()); // Cho phép Frontend gọi API
@@ -14,17 +18,6 @@ app.use(express.json()); // Hỗ trợ body dạng JSON
 
 // Phục vụ toàn bộ giao diện Frontend (HTML, CSS, JS, hình ảnh) từ thư mục gốc
 app.use(express.static(path.join(__dirname, '..')));
-
-// Cấu hình kết nối MySQL (Connection Pool)
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'language',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-});
 
 // API kiểm tra kết nối
 app.get('/api/test-db', async (req, res) => {
@@ -72,7 +65,6 @@ async function initUserStatsTable() {
     console.error('Lỗi khởi tạo bảng user_stats:', err.message);
   }
 }
-initUserStatsTable();
 
 // Lấy thông tin thành tích & hồ sơ người dùng
 app.get('/api/user-stats', async (req, res) => {
@@ -853,20 +845,54 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, '..', 'index.html'));
 });
 
-// Kiểm tra kết nối MySQL khi khởi động
-pool.getConnection()
-  .then(conn => {
-    console.log("✅ Kết nối cơ sở dữ liệu MySQL 'language' thành công!");
-    conn.release();
-  })
-  .catch(err => {
-    console.warn("⚠️ Cảnh báo kết nối MySQL:", err.message);
-    console.warn("👉 Hãy đảm bảo dịch vụ MySQL đang chạy (trong MySQL Workbench hoặc XAMPP) và file .env đúng thông tin.");
+async function createMysqlPool() {
+  const mysqlPool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'language',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    connectTimeout: 4000
   });
+  const conn = await mysqlPool.getConnection();
+  conn.release();
+  return mysqlPool;
+}
 
-// Chạy server
-app.listen(port, () => {
-  console.log(`Server đang chạy tại http://localhost:${port}`);
-  console.log(`Website có thể truy cập trực tiếp tại: http://localhost:${port}`);
+async function start() {
+  const onPaaS = !!(process.env.RENDER || process.env.FLY_APP_NAME || process.env.RAILWAY_ENVIRONMENT);
+  const forceSqlite = String(process.env.USE_SQLITE || '').toLowerCase() === 'true' || (onPaaS && !process.env.DB_HOST);
+  if (!forceSqlite) {
+    try {
+      pool = await createMysqlPool();
+      dbEngine = 'mysql';
+      console.log("✅ Kết nối cơ sở dữ liệu MySQL 'language' thành công!");
+    } catch (err) {
+      console.warn('⚠️ Không kết nối được MySQL:', err.message);
+      console.warn('👉 Chuyển sang SQLite miễn phí để vẫn deploy được trên cloud.');
+      pool = await createSqlitePool();
+      dbEngine = 'sqlite';
+      await seedSqlite(pool);
+    }
+  } else {
+    pool = await createSqlitePool();
+    dbEngine = 'sqlite';
+    await seedSqlite(pool);
+  }
+
+  await initUserStatsTable();
+
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Server đang chạy tại http://localhost:${port}`);
+    console.log(`Website có thể truy cập trực tiếp tại: http://localhost:${port}`);
+    console.log(`Cơ sở dữ liệu: ${dbEngine}`);
+  });
+}
+
+start().catch(err => {
+  console.error('Không khởi động được server:', err);
+  process.exit(1);
 });
 

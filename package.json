@@ -9,6 +9,9 @@
     "init-db": "node server/init-db.js",
     "test": "node test-suite.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [
     "english",
     "kids",

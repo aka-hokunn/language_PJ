@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: funwords-english
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install --prefix server
+    startCommand: node server/server.js
+    healthCheckPath: /api/test-db
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: GEMINI_API_KEY
+        sync: false

@@ -9,6 +9,67 @@ let currentEditingUnitId = null;
 let currentEditingPartId = null;
 let currentContentPartId = null;
 
+function cloneSampleUnits() {
+    const source = (typeof SAMPLE_UNITS !== 'undefined' && Array.isArray(SAMPLE_UNITS)) ? SAMPLE_UNITS : [];
+    return source.map((unit, unitIndex) => ({
+        ...unit,
+        id: unit.id || unitIndex + 1,
+        parts: (unit.parts || []).map((part, partIndex) => ({
+            ...part,
+            id: part.id || (unitIndex + 1) * 100 + partIndex + 1,
+            unit_id: unit.id || unitIndex + 1,
+            custom_words_count: (part.custom_words || []).length,
+            custom_questions_count: (part.custom_questions || []).length
+        }))
+    }));
+}
+
+function getOfflinePartDetails(partId) {
+    for (const unit of UNITS_DATA) {
+        const part = (unit.parts || []).find(item => String(item.id) === String(partId));
+        if (!part) continue;
+        return {
+            ...part,
+            words: (part.custom_words || []).map((word, index) => ({
+                id: word.id || index + 1,
+                en: word.en,
+                vi: word.vi,
+                emoji: word.emoji,
+                phonetic: word.phonetic,
+                example: word.example
+            })),
+            questions: (part.custom_questions || []).map((question, index) => ({
+                id: question.id || index + 1,
+                sentence: question.sentence,
+                answer: question.answer,
+                options: (question.options_str || '').split(','),
+                options_str: question.options_str,
+                hint: question.hint
+            }))
+        };
+    }
+    return null;
+}
+
+function useOfflineCurriculum(showFeedbackToast = false) {
+    const cached = localStorage.getItem('funwords_units');
+    if (cached) {
+        try {
+            UNITS_DATA = JSON.parse(cached);
+        } catch (err) {
+            UNITS_DATA = cloneSampleUnits();
+        }
+    } else {
+        UNITS_DATA = cloneSampleUnits();
+        localStorage.setItem('funwords_units', JSON.stringify(UNITS_DATA));
+    }
+    renderCurriculumPage();
+    renderAdminPage();
+    if (showFeedbackToast) {
+        showToast('📡 Đang dùng dữ liệu bài học offline', 'info');
+    }
+}
+
 // ===== Load Units and Parts from Backend API =====
 async function loadCurriculumData(showFeedbackToast = false) {
     try {
@@ -25,9 +86,7 @@ async function loadCurriculumData(showFeedbackToast = false) {
         }
     } catch (err) {
         console.error('Lỗi khi tải dữ liệu bài học (Unit & Part):', err);
-        if (showFeedbackToast) {
-            showToast('⚠️ Không thể kết nối với máy chủ!', 'error');
-        }
+        useOfflineCurriculum(showFeedbackToast);
     }
 }
 
@@ -319,16 +378,22 @@ function filterAdminUnits() {
 async function launchPartGame(unitId, partId) {
     try {
         showToast('⏳ Đang tải nội dung bài học...', 'info');
-        const res = await fetch(`${API_BASE}/api/parts/${partId}/details`);
-        if (!res.ok) throw new Error('Không thể tải chi tiết Part');
-        const json = await res.json();
-        
-        if (!json.success || !json.data) {
+        let part = null;
+        try {
+            const res = await fetch(`${API_BASE}/api/parts/${partId}/details`);
+            if (res.ok) {
+                const json = await res.json();
+                if (json.success && json.data) part = json.data;
+            }
+        } catch (apiErr) {
+            console.warn('API Part details không khả dụng, dùng dữ liệu offline.', apiErr);
+        }
+        if (!part) part = getOfflinePartDetails(partId);
+        if (!part) {
             showToast('Không tìm thấy thông tin bài học!', 'error');
             return;
         }
 
-        const part = json.data;
         const unit = UNITS_DATA.find(u => u.id === unitId) || { title: `Unit ${part.unit_id}` };
 
         // Lưu thông tin vào gameState
