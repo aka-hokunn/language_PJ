@@ -3,6 +3,7 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 const path = require('path');
 const { createSqlitePool } = require('./sqlite-pool');
+const { createLibsqlPool } = require('./libsql-pool');
 const { seedSqlite } = require('./seed-sqlite');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -15,6 +16,27 @@ let dbEngine = 'mysql';
 // Middleware
 app.use(cors()); // Cho phép Frontend gọi API
 app.use(express.json()); // Hỗ trợ body dạng JSON
+
+app.use((req, res, next) => {
+  const raw = String(req.get('x-player-id') || 'local');
+  req.playerKey = /^[A-Za-z0-9_-]{4,80}$/.test(raw) ? raw : 'local';
+  next();
+});
+
+function adminAllowed(req) {
+  const pin = (process.env.ADMIN_PIN || '').trim();
+  if (!pin) return true;
+  return String(req.get('x-admin-pin') || '') === pin;
+}
+
+app.use((req, res, next) => {
+  const needsPin = ['POST', 'PUT', 'DELETE'].includes(req.method)
+    && (/^\/api\/(units|parts)(\/|$)/.test(req.path) || req.path === '/api/ai/set-key');
+  if (needsPin && !adminAllowed(req)) {
+    return res.status(401).json({ success: false, message: 'Cần mã giáo viên để lưu bài học.' });
+  }
+  next();
+});
 
 // Phục vụ toàn bộ giao diện Frontend (HTML, CSS, JS, hình ảnh) từ thư mục gốc
 app.use(express.static(path.join(__dirname, '..')));
@@ -34,11 +56,35 @@ app.get('/api/test-db', async (req, res) => {
 // 🏆 USER STATS & ACHIEVEMENTS TABLE & APIS
 // ==========================================
 
+function todayVN() {
+  return new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function dateOnly(value) {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const y = value.getFullYear();
+    const m = String(value.getMonth() + 1).padStart(2, '0');
+    const d = String(value.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  const match = String(value).match(/\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : null;
+}
+
+function daysBetween(fromDate, toDate) {
+  if (!fromDate || !toDate) return null;
+  const from = new Date(`${fromDate}T00:00:00Z`).getTime();
+  const to = new Date(`${toDate}T00:00:00Z`).getTime();
+  return Math.round((to - from) / 86400000);
+}
+
 async function initUserStatsTable() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS user_stats (
         id INT PRIMARY KEY AUTO_INCREMENT,
+        player_key VARCHAR(64) DEFAULT NULL,
         name VARCHAR(100) DEFAULT 'Bé Yêu',
         age INT DEFAULT 7,
         avatar VARCHAR(20) DEFAULT '🦊',
@@ -52,13 +98,40 @@ async function initUserStatsTable() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+    try {
+      await pool.query('ALTER TABLE user_stats ADD COLUMN player_key VARCHAR(64)');
+    } catch (err) {
+      // Cột đã có trên database cũ.
+    }
+    await pool.query("UPDATE user_stats SET player_key = 'local' WHERE player_key IS NULL OR player_key = ''");
+    try {
+      await pool.query('CREATE UNIQUE INDEX idx_user_stats_player ON user_stats(player_key)');
+    } catch (err) {
+      // Index đã tồn tại.
+    }
 
-    const [rows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS game_history (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        player_key VARCHAR(64),
+        game_id VARCHAR(40),
+        score INT DEFAULT 0,
+        words_count INT DEFAULT 0,
+        correct_answers INT DEFAULT 0,
+        total_questions INT DEFAULT 0,
+        stars INT DEFAULT 0,
+        unit_id INT DEFAULT NULL,
+        part_id INT DEFAULT NULL,
+        played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const [rows] = await pool.query("SELECT * FROM user_stats WHERE player_key = 'local'");
     if (rows.length === 0) {
       await pool.query(`
-        INSERT INTO user_stats (id, name, age, avatar, total_stars, games_played, words_learned, streak, last_active_date, unlocked_badges)
-        VALUES (1, 'Bé Yêu', 7, '🦊', 0, 0, 0, 1, CURDATE(), '[]')
-      `);
+        INSERT INTO user_stats (name, age, avatar, total_stars, games_played, words_learned, streak, last_active_date, unlocked_badges, player_key)
+        VALUES ('Bé Yêu', 7, '🦊', 0, 0, 0, 1, ?, '[]', 'local')
+      `, [todayVN()]);
       console.log('✅ Khởi tạo thành công bản ghi thành tích mặc định trong user_stats');
     }
   } catch (err) {
@@ -66,35 +139,89 @@ async function initUserStatsTable() {
   }
 }
 
+async function ensurePlayer(playerKey) {
+  const [rows] = await pool.query('SELECT * FROM user_stats WHERE player_key = ?', [playerKey]);
+  if (rows.length > 0) return rows[0];
+  await pool.query(`
+    INSERT INTO user_stats (name, age, avatar, total_stars, games_played, words_learned, streak, last_active_date, unlocked_badges, player_key)
+    VALUES ('Bé Yêu', 7, '🦊', 0, 0, 0, 1, ?, '[]', ?)
+  `, [todayVN(), playerKey]);
+  const [fresh] = await pool.query('SELECT * FROM user_stats WHERE player_key = ?', [playerKey]);
+  return fresh[0];
+}
+
+function nextStreak(user) {
+  const today = todayVN();
+  const last = dateOnly(user.last_active_date);
+  let streak = user.streak || 1;
+  const gap = daysBetween(last, today);
+  if (gap === 1) streak += 1;
+  else if (gap !== null && gap > 1) streak = 1;
+  return { streak, today };
+}
+
 // Lấy thông tin thành tích & hồ sơ người dùng
 app.get('/api/user-stats', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
-    if (rows.length === 0) {
-      await initUserStatsTable();
-      const [newRows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
-      return res.json({ success: true, data: newRows[0] });
+    let user = await ensurePlayer(req.playerKey);
+    const gap = daysBetween(dateOnly(user.last_active_date), todayVN());
+    if (gap !== null && gap > 1 && user.streak !== 1) {
+      user.streak = 1;
+      await pool.query('UPDATE user_stats SET streak = 1 WHERE player_key = ?', [req.playerKey]);
     }
-    
-    const user = rows[0];
-    
-    // Kiểm tra tính liên tục của chuỗi ngày học (streak)
-    if (user.last_active_date) {
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const lastDate = new Date(user.last_active_date);
-      const today = new Date(todayStr);
-      const diffTime = today.getTime() - lastDate.getTime();
-      const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-      
-      if (diffDays > 1) {
-        user.streak = 1;
-        await pool.query('UPDATE user_stats SET streak = 1 WHERE id = 1');
-      }
-    }
-
     res.json({ success: true, data: user });
   } catch (error) {
     console.error('Lỗi khi lấy user_stats:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT name, avatar, total_stars, games_played, words_learned, streak
+      FROM user_stats
+      WHERE games_played > 0
+      ORDER BY total_stars DESC, words_learned DESC
+      LIMIT 8
+    `);
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/user-stats/history', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT game_id, score, words_count, correct_answers, total_questions, stars, unit_id, part_id, played_at
+      FROM game_history
+      WHERE player_key = ?
+      ORDER BY id DESC
+      LIMIT 40
+    `, [req.playerKey]);
+    const [bestRows] = await pool.query(`
+      SELECT game_id, MAX(score) AS best_score
+      FROM game_history
+      WHERE player_key = ?
+      GROUP BY game_id
+    `, [req.playerKey]);
+    res.json({ success: true, data: rows, bestScores: bestRows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/user-stats/progress', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT unit_id, SUM(score) AS stars, COUNT(*) AS plays
+      FROM game_history
+      WHERE player_key = ? AND unit_id IS NOT NULL
+      GROUP BY unit_id
+    `, [req.playerKey]);
+    res.json({ success: true, data: rows });
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -104,45 +231,40 @@ app.post('/api/user-stats/record-game', async (req, res) => {
   try {
     const score = Math.max(0, parseInt(req.body.score) || 0);
     const wordsCount = Math.max(0, parseInt(req.body.wordsCount) || 0);
+    const correctAnswers = Math.max(0, parseInt(req.body.correctAnswers) || 0);
+    const totalQuestions = Math.max(0, parseInt(req.body.totalQuestions) || 0);
+    const stars = Math.max(0, Math.min(3, parseInt(req.body.stars) || 0));
+    const unitId = req.body.unitId ? parseInt(req.body.unitId) : null;
+    const partId = req.body.partId ? parseInt(req.body.partId) : null;
+    const gameId = String(req.body.gameId || 'game').slice(0, 40);
 
-    const [rows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
-    let user = rows[0];
-    if (!user) {
-      await initUserStatsTable();
-      const [fresh] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
-      user = fresh[0];
-    }
-
-    let newStreak = user.streak || 1;
-    const todayStr = new Date().toISOString().slice(0, 10);
-    if (user.last_active_date) {
-      const lastDate = new Date(user.last_active_date);
-      const today = new Date(todayStr);
-      const diffTime = today.getTime() - lastDate.getTime();
-      const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-      
-      if (diffDays === 1) {
-        newStreak += 1;
-      } else if (diffDays > 1) {
-        newStreak = 1;
-      }
-    }
-
+    const user = await ensurePlayer(req.playerKey);
+    const { streak: newStreak, today } = nextStreak(user);
     const newStars = (user.total_stars || 0) + score;
     const newGames = (user.games_played || 0) + 1;
     const newWords = (user.words_learned || 0) + wordsCount;
 
     await pool.query(`
       UPDATE user_stats 
-      SET total_stars = ?, games_played = ?, words_learned = ?, streak = ?, last_active_date = CURDATE()
-      WHERE id = 1
-    `, [newStars, newGames, newWords, newStreak]);
+      SET total_stars = ?, games_played = ?, words_learned = ?, streak = ?, last_active_date = ?
+      WHERE player_key = ?
+    `, [newStars, newGames, newWords, newStreak, today, req.playerKey]);
 
-    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
+    await pool.query(`
+      INSERT INTO game_history (player_key, game_id, score, words_count, correct_answers, total_questions, stars, unit_id, part_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [req.playerKey, gameId, score, wordsCount, correctAnswers, totalQuestions, stars, unitId, partId]);
+
+    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE player_key = ?', [req.playerKey]);
+    const [bestRows] = await pool.query(
+      'SELECT MAX(score) AS best_score FROM game_history WHERE player_key = ? AND game_id = ?',
+      [req.playerKey, gameId]
+    );
     res.json({
       success: true,
-      message: 'Đã lưu thành tích vào cơ sở dữ liệu MySQL thành công!',
-      data: updatedRows[0]
+      message: 'Đã lưu thành tích vào cơ sở dữ liệu thành công!',
+      data: updatedRows[0],
+      bestScore: bestRows[0] ? Number(bestRows[0].best_score || score) : score
     });
   } catch (error) {
     console.error('Lỗi khi lưu thành tích game:', error);
@@ -154,15 +276,16 @@ app.post('/api/user-stats/record-game', async (req, res) => {
 app.put('/api/user-stats/profile', async (req, res) => {
   try {
     const { name, age, avatar } = req.body;
+    await ensurePlayer(req.playerKey);
     await pool.query(`
       UPDATE user_stats
       SET name = COALESCE(?, name),
           age = COALESCE(?, age),
           avatar = COALESCE(?, avatar)
-      WHERE id = 1
-    `, [name ? name.trim() : null, age ? parseInt(age) : null, avatar ? avatar.trim() : null]);
+      WHERE player_key = ?
+    `, [name ? String(name).trim().slice(0, 40) : null, age ? parseInt(age) : null, avatar ? String(avatar).trim().slice(0, 8) : null, req.playerKey]);
 
-    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
+    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE player_key = ?', [req.playerKey]);
     res.json({
       success: true,
       message: 'Đã lưu hồ sơ vào cơ sở dữ liệu MySQL thành công!',
@@ -177,12 +300,13 @@ app.put('/api/user-stats/profile', async (req, res) => {
 // Đặt lại thành tích (Reset)
 app.post('/api/user-stats/reset', async (req, res) => {
   try {
+    await ensurePlayer(req.playerKey);
     await pool.query(`
       UPDATE user_stats
-      SET total_stars = 0, games_played = 0, words_learned = 0, streak = 1, last_active_date = CURDATE()
-      WHERE id = 1
-    `);
-    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE id = 1');
+      SET total_stars = 0, games_played = 0, words_learned = 0, streak = 1, last_active_date = ?
+      WHERE player_key = ?
+    `, [todayVN(), req.playerKey]);
+    const [updatedRows] = await pool.query('SELECT * FROM user_stats WHERE player_key = ?', [req.playerKey]);
     res.json({
       success: true,
       message: 'Đã đặt lại thành tích về 0 trong cơ sở dữ liệu!',
@@ -862,9 +986,15 @@ async function createMysqlPool() {
 }
 
 async function start() {
+  const hasTurso = !!(process.env.TURSO_DATABASE_URL && process.env.TURSO_AUTH_TOKEN);
   const onPaaS = !!(process.env.RENDER || process.env.FLY_APP_NAME || process.env.RAILWAY_ENVIRONMENT);
-  const forceSqlite = String(process.env.USE_SQLITE || '').toLowerCase() === 'true' || (onPaaS && !process.env.DB_HOST);
-  if (!forceSqlite) {
+  const forceSqlite = String(process.env.USE_SQLITE || '').toLowerCase() === 'true' || (onPaaS && !process.env.DB_HOST && !hasTurso);
+  if (hasTurso) {
+    pool = createLibsqlPool();
+    dbEngine = 'turso';
+    await seedSqlite(pool);
+    console.log('✅ Đã kết nối Turso, database bền trên mây');
+  } else if (!forceSqlite) {
     try {
       pool = await createMysqlPool();
       dbEngine = 'mysql';

@@ -3,6 +3,40 @@
    Navigation, effects, initialization
    ========================================== */
 
+function getPlayerId() {
+    let id = localStorage.getItem('funwords_player_id');
+    if (!id || !/^[A-Za-z0-9_-]{4,80}$/.test(id)) {
+        id = `p${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+        localStorage.setItem('funwords_player_id', id);
+    }
+    return id;
+}
+
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async function(input, init = {}) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!url.includes('/api/')) return nativeFetch(input, init);
+
+    const headers = new Headers(init.headers || {});
+    if (!headers.has('X-Player-Id')) headers.set('X-Player-Id', getPlayerId());
+    const savedPin = sessionStorage.getItem('funwords_admin_pin');
+    if (savedPin && !headers.has('X-Admin-Pin')) headers.set('X-Admin-Pin', savedPin);
+
+    const nextInit = { ...init, headers };
+    let response = await nativeFetch(input, nextInit);
+    const method = String(nextInit.method || 'GET').toUpperCase();
+    const isTeacherWrite = method !== 'GET' && /\/api\/(units|parts|ai\/set-key)/.test(url);
+    if (response.status === 401 && isTeacherWrite) {
+        const entered = window.prompt('Nhập mã giáo viên để lưu bài học trên mây:');
+        if (entered) {
+            sessionStorage.setItem('funwords_admin_pin', entered.trim());
+            headers.set('X-Admin-Pin', entered.trim());
+            response = await nativeFetch(input, { ...nextInit, headers });
+        }
+    }
+    return response;
+};
+
 // ===== Page Navigation =====
 function showPage(pageId) {
     // Stop any running game timers
@@ -36,7 +70,10 @@ function showPage(pageId) {
     document.querySelector('.nav-links')?.classList.remove('show');
 
     // Page-specific init
-    if (pageId === 'curriculum') renderCurriculumPage();
+    if (pageId === 'curriculum') {
+        renderCurriculumPage();
+        if (typeof loadUnitProgress === 'function') loadUnitProgress();
+    }
     if (pageId === 'admin') renderAdminPage();
     if (pageId === 'games') populateGamesList();
     if (pageId === 'achievements') populateAchievements();
@@ -166,6 +203,15 @@ function applyUserStats(stats) {
     const avatarEl = document.querySelector('.avatar-emoji');
     if (avatarEl) avatarEl.textContent = avatar;
 
+    const level = Math.max(1, Math.floor(Number(stars) / 100) + 1);
+    const intoLevel = Number(stars) % 100;
+    const levelEl = document.getElementById('profileLevel');
+    if (levelEl) levelEl.textContent = `Lv. ${level}`;
+    const levelFill = document.getElementById('profileLevelFill');
+    if (levelFill) levelFill.style.width = `${intoLevel}%`;
+    const levelXp = document.getElementById('profileLevelXp');
+    if (levelXp) levelXp.textContent = `${intoLevel}/100 XP`;
+
     // Lưu vào localStorage làm bản cache offline
     localStorage.setItem('totalStars', stars);
     localStorage.setItem('gamesPlayed', games);
@@ -218,18 +264,84 @@ function populateAchievements() {
         `).join('');
     }
 
-    // Populate calendar
-    populateCalendar();
+    populateCalendar([]);
+    loadAchievementExtras();
 }
 
-function populateCalendar() {
+const GAME_NAME_MAP = {
+    wordmatch: 'Nối Từ',
+    spelling: 'Đánh Vần',
+    scramble: 'Xếp Chữ',
+    flashcards: 'Thẻ Ghi Nhớ',
+    fillblank: 'Điền Từ',
+    wordcatcher: 'Bắt Từ'
+};
+
+async function loadAchievementExtras() {
+    const apiBase = window.location.origin.startsWith('http') ? '' : 'http://localhost:3000';
+    try {
+        const [historyRes, boardRes] = await Promise.all([
+            fetch(`${apiBase}/api/user-stats/history`),
+            fetch(`${apiBase}/api/leaderboard`)
+        ]);
+        if (historyRes.ok) {
+            const history = await historyRes.json();
+            const dates = (history.data || []).map(row => String(row.played_at || '').slice(0, 10));
+            populateCalendar(dates);
+            renderBestScores(history.bestScores || []);
+        }
+        if (boardRes.ok) {
+            const board = await boardRes.json();
+            renderLeaderboard(board.data || []);
+        }
+    } catch (err) {
+        console.warn('Chưa tải được thành tích trên mây:', err);
+    }
+}
+
+function renderLeaderboard(rows) {
+    const list = document.getElementById('leaderboardList');
+    if (!list) return;
+    if (!rows.length) {
+        list.innerHTML = '<p class="cloud-empty">Chưa có bạn nào trên bảng xếp hạng. Hoàn thành một ván để ghi tên nhé!</p>';
+        return;
+    }
+    list.innerHTML = rows.map((row, index) => `
+        <div class="leaderboard-row">
+            <span class="leaderboard-rank">${index + 1}</span>
+            <span class="leaderboard-avatar">${row.avatar || '🦊'}</span>
+            <span class="leaderboard-name">${row.name || 'Bé Yêu'}</span>
+            <span class="leaderboard-score">⭐ ${row.total_stars || 0}</span>
+        </div>
+    `).join('');
+}
+
+function renderBestScores(rows) {
+    const list = document.getElementById('bestScoresList');
+    if (!list) return;
+    if (!rows.length) {
+        list.innerHTML = '<p class="cloud-empty">Kỷ lục sẽ hiện ở đây sau ván chơi đầu tiên.</p>';
+        return;
+    }
+    list.innerHTML = rows.map(row => `
+        <div class="best-score-chip">
+            <span>${GAME_NAME_MAP[row.game_id] || 'Trò chơi'}</span>
+            <strong>⭐ ${row.best_score || 0}</strong>
+        </div>
+    `).join('');
+}
+
+function populateCalendar(activeDates = []) {
     const calendarEl = document.getElementById('learningCalendar');
+    if (!calendarEl) return;
     const today = new Date();
     const daysInMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
     const firstDay = new Date(today.getFullYear(), today.getMonth(), 1).getDay();
-    
-    // Simulated active days
-    const activeDays = [1, 2, 3, 5, 6, 7, 10, 11, 14, 15, 16, 19, 20, 21, 22, today.getDate()];
+    const activeDays = activeDates.map(date => {
+        const [year, month, day] = String(date).slice(0, 10).split('-').map(Number);
+        if (year === today.getFullYear() && month === today.getMonth() + 1) return day;
+        return null;
+    }).filter(Boolean);
 
     const dayHeaders = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
     
@@ -1602,6 +1714,19 @@ function initMascotSpeech() {
 
 // ===== Daily Word =====
 let currentDailyWord = null;
+
+function practiceDailyWord() {
+    if (!Array.isArray(DAILY_WORDS) || DAILY_WORDS.length === 0) {
+        showToast('Chưa có từ hôm nay để luyện.', 'warning');
+        return;
+    }
+    gameState.customWords = DAILY_WORDS.slice();
+    gameState.customQuestions = null;
+    gameState.isTeachingMode = false;
+    gameState.currentUnitId = null;
+    gameState.currentPartId = null;
+    startGame('flashcards', { keepLesson: true });
+}
 
 function speakDailyWord() {
     if (currentDailyWord && currentDailyWord.en) {

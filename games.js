@@ -110,6 +110,7 @@ function resetGameState() {
     gameState.streak = 0;
     gameState.startTime = Date.now();
     gameState.words = [];
+    gameState.mistakes = [];
     stopTimer();
 }
 
@@ -150,7 +151,13 @@ function showComboBanner(streak) {
     }, 1200);
 }
 
-function showFeedback(correct) {
+function showFeedback(correct, word) {
+    if (!correct && word && word.en) {
+        gameState.mistakes = gameState.mistakes || [];
+        if (!gameState.mistakes.some(item => item.en === word.en)) {
+            gameState.mistakes.push({ en: word.en, vi: word.vi || '' });
+        }
+    }
     if (correct) {
         gameState.streak = (gameState.streak || 0) + 1;
         gameState.score += 10;
@@ -238,6 +245,15 @@ function endGame() {
     if (scoreEl) scoreEl.textContent = gameState.score;
     if (correctEl) correctEl.textContent = `${gameState.correctAnswers}/${gameState.totalQuestions}`;
     if (timeEl) timeEl.textContent = `${timeTaken}s`;
+    const reviewEl = document.getElementById('resultReview');
+    const bestEl = document.getElementById('resultBest');
+    if (bestEl) bestEl.textContent = '';
+    if (reviewEl) {
+        const mistakes = gameState.mistakes || [];
+        reviewEl.innerHTML = mistakes.length
+            ? `<h3>Ôn lại từ chưa đúng</h3>${mistakes.map(item => `<div class="review-word"><strong>${item.en}</strong><span>${item.vi}</span></div>`).join('')}`
+            : '';
+    }
 
     // Show stars
     const starsContainer = document.getElementById('resultStars');
@@ -275,12 +291,24 @@ function endGame() {
                 const res = await fetch(`${apiBase}/api/user-stats/record-game`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ score: newScore, wordsCount: newWords })
+                    body: JSON.stringify({
+                        score: newScore,
+                        wordsCount: newWords,
+                        gameId: currentGame,
+                        correctAnswers: gameState.correctAnswers,
+                        totalQuestions: gameState.totalQuestions,
+                        stars: totalStars,
+                        unitId: gameState.currentUnitId || null,
+                        partId: gameState.currentPartId || null
+                    })
                 });
                 if (res.ok) {
                     const json = await res.json();
                     if (json.success && json.data) {
                         if (typeof window !== 'undefined' && window.applyUserStats) window.applyUserStats(json.data);
+                        const bestNode = document.getElementById('resultBest');
+                        if (bestNode && json.bestScore) bestNode.textContent = `Kỷ lục trò này: ⭐ ${json.bestScore}`;
+                        if (typeof loadUnitProgress === 'function') loadUnitProgress();
                     }
                 }
             } catch (e) {
@@ -320,7 +348,7 @@ window.closeResultModal = closeResultModal;
 
 function replayGame() {
     closeResultModal();
-    if (currentGame) startGame(currentGame);
+    if (currentGame) startGame(currentGame, { keepLesson: true });
 }
 
 function nextTeachingPart() {
@@ -423,7 +451,7 @@ function initWordMatch() {
                 }
             } else {
                 el.classList.add('wrong');
-                showFeedback(false);
+                showFeedback(false, words.find(item => item.en === selectedEn));
                 setTimeout(() => {
                     el.classList.remove('wrong');
                     container.querySelectorAll('.en-item').forEach(e => e.classList.remove('selected'));
@@ -595,7 +623,7 @@ function initSpelling() {
                     inp.classList.add('wrong');
                 }
             });
-            showFeedback(false);
+            showFeedback(false, targetWord);
 
             setTimeout(() => {
                 inputs.forEach(inp => {
@@ -835,7 +863,7 @@ function initScramble() {
                     showScrambleWord(currentWordIndex);
                 }, 800);
             } else {
-                showFeedback(false);
+                showFeedback(false, words[currentWordIndex]);
                 updateGameUI();
                 // Reset khi sai
                 setTimeout(() => {
@@ -969,6 +997,13 @@ function initFlashcards() {
         if (knew) {
             showFeedback(true);
         } else {
+            const missed = words[currentCardIndex];
+            if (missed && missed.en) {
+                gameState.mistakes = gameState.mistakes || [];
+                if (!gameState.mistakes.some(item => item.en === missed.en)) {
+                    gameState.mistakes.push({ en: missed.en, vi: missed.vi || '' });
+                }
+            }
             if (window.soundEngine) window.soundEngine.playSfx('boing');
             if (typeof showToast === 'function') {
                 showToast('🌱 Không sao hết! Xem lại một chút là nhớ liền nè!', 'info');
@@ -1057,7 +1092,7 @@ function initFillBlank() {
                     o.classList.add('correct');
                 }
             });
-            showFeedback(false);
+            showFeedback(false, { en: correct, vi: 'Đáp án đúng' });
         }
 
         gameState.currentQuestion++;
@@ -1188,7 +1223,7 @@ function initWordCatcher() {
                     if (catcherArea) catcherArea.appendChild(flopEl);
                     setTimeout(() => { if (flopEl.parentNode) flopEl.remove(); }, 850);
 
-                    showFeedback(false);
+                    showFeedback(false, currentTarget);
                     updateGameUI();
                 }
                 setTimeout(() => { if (fallingWord.parentNode) fallingWord.remove(); }, 400);
@@ -1213,8 +1248,16 @@ function initWordCatcher() {
 }
 
 // ===== Start Game Router =====
-function startGame(gameId) {
+function startGame(gameId, options = {}) {
     currentGame = gameId;
+    if (!options.keepLesson) {
+        gameState.isTeachingMode = false;
+        gameState.customWords = null;
+        gameState.customQuestions = null;
+        gameState.currentUnitId = null;
+        gameState.currentPartId = null;
+        gameState.currentPart = null;
+    }
     resetGameState();
     showPage('gameplay');
 

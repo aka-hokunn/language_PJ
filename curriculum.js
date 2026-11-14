@@ -71,6 +71,23 @@ function useOfflineCurriculum(showFeedbackToast = false) {
 }
 
 // ===== Load Units and Parts from Backend API =====
+async function loadUnitProgress() {
+    try {
+        const res = await fetch(`${API_BASE}/api/user-stats/progress`);
+        if (!res.ok) return;
+        const json = await res.json();
+        window.UNIT_PROGRESS = {};
+        (json.data || []).forEach(row => {
+            window.UNIT_PROGRESS[row.unit_id] = row;
+        });
+        if (document.getElementById('page-curriculum')?.classList.contains('active')) {
+            renderCurriculumPage();
+        }
+    } catch (err) {
+        console.warn('Chưa tải được tiến độ Unit:', err);
+    }
+}
+
 async function loadCurriculumData(showFeedbackToast = false) {
     try {
         const res = await fetch(`${API_BASE}/api/units`);
@@ -80,6 +97,7 @@ async function loadCurriculumData(showFeedbackToast = false) {
             UNITS_DATA = json.data || [];
             renderCurriculumPage();
             renderAdminPage();
+            loadUnitProgress();
             if (showFeedbackToast) {
                 showToast('✅ Đã làm mới dữ liệu bài học!', 'success');
             }
@@ -139,6 +157,7 @@ function renderCurriculumPage() {
                             <span class="unit-parts-count">
                                 📚 ${parts.length} Phần bài học / Mini-game
                             </span>
+                            <span class="unit-parts-count">⭐ ${Number(((window.UNIT_PROGRESS || {})[unit.id] || {}).stars || 0)} sao</span>
                         </div>
                         <h2 class="unit-title">${unit.title}</h2>
                         <p class="unit-desc">${unit.description || 'Chương trình rèn luyện tiếng Anh tích hợp trò chơi.'}</p>
@@ -416,7 +435,7 @@ async function launchPartGame(unitId, partId) {
         }
 
         // Bắt đầu game
-        startGame(part.game_type);
+        startGame(part.game_type, { keepLesson: true });
 
         const wordCount = gameState.customWords ? gameState.customWords.length : 0;
         showToast(`🎓 Đang giảng dạy: ${part.title} ${wordCount ? `(${wordCount} từ riêng)` : ''}`, 'success');

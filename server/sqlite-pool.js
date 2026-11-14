@@ -74,4 +74,4 @@ async function createSqlitePool() {
   };
 }
 
-module.exports = { createSqlitePool, DB_PATH };
+module.exports = { createSqlitePool, DB_PATH, toSqliteSql, isSelect };
